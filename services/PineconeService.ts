@@ -1,0 +1,124 @@
+import { Pinecone } from '@pinecone-database/pinecone';
+import { ChunkMetadata } from '../types';
+
+export class PineconeService {
+  private index: any; // Pinecone index
+  private dimension: number;
+
+  constructor(apiKey: string, indexName: string, dimension: number) {
+    const pinecone = new Pinecone({ apiKey });
+    this.index = pinecone.index(indexName);
+    this.dimension = dimension;
+  }
+
+  async upsert(vectors: Array<{ id: string; values: number[]; metadata: ChunkMetadata }>): Promise<void> {
+    try {
+      // Validate vector dimensions are consistent
+      if (vectors.length === 0) {
+        throw new Error('Cannot upsert empty vector array');
+      }
+
+      const firstDimension = vectors[0].values.length;
+      for (const vector of vectors) {
+        if (vector.values.length !== firstDimension) {
+          throw new Error(`Vector dimension mismatch: expected ${firstDimension} but found ${vector.values.length}`);
+        }
+      }
+
+      if (this.dimension && firstDimension !== this.dimension) {
+      }
+
+      await this.index.upsert(vectors);
+    } catch (error) {
+      const err = error as Error;
+      if (err.message.includes('dimension')) {
+        throw new Error(
+          `Failed to upsert vectors to Pinecone: ${err.message}. ` +
+          `Your Pinecone index is configured for ${this.dimension} dimensions, but vectors have ${vectors[0]?.values.length || 'unknown'} dimensions. ` +
+          `Please recreate your Pinecone index with ${vectors[0]?.values.length || 768} dimensions to match your embedding model.`
+        );
+      }
+      throw new Error(`Failed to upsert vectors to Pinecone: ${err.message}`);
+    }
+  }
+
+  async upsertChunks(chunks: Array<{ id: string; vector: number[]; metadata: ChunkMetadata }>): Promise<void> {
+    const vectors = chunks.map(chunk => ({
+      id: chunk.id,
+      values: chunk.vector,
+      metadata: chunk.metadata
+    }));
+    await this.upsert(vectors);
+  }
+
+  async query(vector: number[], topK: number = 5, filter?: any): Promise<Array<{ id: string; score: number; metadata: ChunkMetadata }>> {
+    try {
+      const queryResponse = await this.index.query({
+        vector,
+        topK,
+        includeMetadata: true,
+        filter
+      });
+
+      return queryResponse.matches.map((match: any) => ({
+        id: match.id,
+        score: match.score,
+        metadata: match.metadata as ChunkMetadata
+      }));
+    } catch (error) {
+      throw new Error(`Failed to query Pinecone: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  async getStats(): Promise<any> {
+    try {
+      return await this.index.describeIndexStats();
+    } catch (error) {
+      throw new Error(`Failed to get Pinecone stats: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  async getIndexMetric(): Promise<'cosine' | 'euclidean' | 'dotproduct'> {
+    try {
+      const stats = await this.index.describeIndexStats();
+      return (stats.metric as 'cosine' | 'euclidean' | 'dotproduct') || 'cosine';
+    } catch (error) {
+      return 'cosine';
+    }
+  }
+
+  async fetchById(id: string): Promise<{ id: string; values: number[]; metadata: ChunkMetadata } | null> {
+    try {
+      const fetchResponse = await this.index.fetch([id]);
+      const record = fetchResponse.records?.[id];
+      if (!record) {
+        return null;
+      }
+      return {
+        id: record.id,
+        values: record.values,
+        metadata: record.metadata as ChunkMetadata
+      };
+    } catch (error) {
+      throw new Error(`Failed to fetch vector by ID from Pinecone: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  async fetchByIds(ids: string[]): Promise<Array<{ id: string; values: number[]; metadata: ChunkMetadata }>> {
+    try {
+      if (ids.length === 0) {
+        return [];
+      }
+      const fetchResponse = await this.index.fetch(ids);
+      const records = fetchResponse.records || {};
+      return Object.values(records).map((record: any) => ({
+        id: record.id,
+        values: record.values,
+        metadata: record.metadata as ChunkMetadata
+      }));
+    } catch (error) {
+      throw new Error(`Failed to fetch vectors by IDs from Pinecone: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+}
+
