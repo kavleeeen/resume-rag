@@ -1,12 +1,10 @@
 import { db } from '../services/DatabaseService';
 import { DocumentProcessingWorker } from '../services/DocumentProcessingWorker';
-import { PineconeService } from '../services/PineconeService';
 import * as fs from 'fs';
 import * as path from 'path';
 
 describe('E2E Document Processing', () => {
   let worker: DocumentProcessingWorker;
-  let pineconeService: PineconeService;
 
   beforeAll(async () => {
     // Connect to database
@@ -28,8 +26,6 @@ describe('E2E Document Processing', () => {
       pineconeIndexName,
       embeddingDimension
     );
-
-    pineconeService = new PineconeService(pineconeApiKey, pineconeIndexName, embeddingDimension);
   });
 
   afterAll(async () => {
@@ -89,9 +85,10 @@ describe('E2E Document Processing', () => {
 
     const jdRecord = await db.getJD(jdDocId);
     expect(jdRecord).not.toBeNull();
-    expect(jdRecord?.requiredSkills).toBeDefined();
-    expect(Array.isArray(jdRecord?.requiredSkills)).toBe(true);
-    expect(jdRecord?.requiredSkills.length).toBeGreaterThan(0);
+    expect(jdRecord?.topSkills).toBeDefined();
+    expect(Array.isArray(jdRecord?.topSkills)).toBe(true);
+    const totalSkills = (jdRecord?.topSkills?.length || 0) + (jdRecord?.generalSkills?.length || 0);
+    expect(totalSkills).toBeGreaterThan(0);
 
     // Query Pinecone for docvec
     const resumeDocRecord = await db.getDocument(resumeDocId);

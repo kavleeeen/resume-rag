@@ -1,6 +1,7 @@
 import { PineconeService } from './PineconeService';
 import { db } from './DatabaseService';
 import { EmbeddingService } from './EmbeddingService';
+import { normalizeScore as normalizeScoreUtil } from '../utils/scoreNormalization';
 
 export interface MatchResult {
   resumeId: string;
@@ -24,7 +25,7 @@ export interface MatchResult {
 export class MatchingService {
   private pineconeService: PineconeService;
   private embeddingService: EmbeddingService;
-  private indexMetric: 'cosine' | 'euclidean' | 'dotproduct' = 'cosine';
+  private indexMetric: 'cosine' | 'euclidean' | 'dotproduct' | null = null;
 
   constructor(
     pineconeService: PineconeService,
@@ -32,107 +33,215 @@ export class MatchingService {
   ) {
     this.pineconeService = pineconeService;
     this.embeddingService = embeddingService;
+    // Cache index metric in constructor (or init)
+    this.pineconeService.getIndexMetric()
+      .then(metric => {
+        this.indexMetric = metric;
+        console.log('[MatchingService] Detected metric:', metric);
+      })
+      .catch(err => {
+        console.warn('[MatchingService] Failed to get metric, defaulting to cosine', err);
+        this.indexMetric = 'cosine';
+      });
   }
 
+  /**
+   * Get the cached index metric, initializing if needed
+   */
+  private async getIndexMetric(): Promise<'cosine' | 'euclidean' | 'dotproduct'> {
+    if (this.indexMetric !== null) {
+      return this.indexMetric;
+    }
+    // Wait a bit for initialization if in progress, then return default
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (this.indexMetric !== null) {
+      return this.indexMetric;
+    }
+    // Ultimate fallback
+    return 'cosine';
+  }
+
+  /**
+   * Calculate match score between a Resume and Job Description
+   * 
+   * How Semantic Matching Works (Step-by-Step):
+   * 
+   * 1️⃣ Break documents into chunks
+   *    - Resume: Split into chunks (40-150 vectors) - each work section, skill block, project, etc.
+   *    - JD: Stored as 1 doc-level embedding (summarized meaning representation)
+   * 
+   * 2️⃣ Convert text → embeddings
+   *    - Use language model (Gemini) to convert text into vectors [0.12, -0.33, 0.88, ...]
+   *    - Vectors with similar meanings lie closer together in space
+   * 
+   * 3️⃣ Compare embeddings using similarity search
+   *    - Query Pinecone with JD vector
+   *    - Find closest resume chunks
+   *    - If closest chunks match required skills/responsibilities → Strong semantic match
+   *    - Similarity metric (cosine): Same meaning → 1.0, Different → 0.0
+   * 
+   * 4️⃣ Aggregation of top semantic matches
+   *    - Take top relevant resume chunks
+   *    - Normalize scores to [0-1]
+   *    - Use meanTopN(3) to get final semantic score
+   * 
+   * Final Score = weighted combination of:
+   * - Semantic Score: Conceptual match (catches "AWS" vs "EC2 via Kubernetes")
+   * - Keyword Score: Exact skill matches
+   * - Years Score: Experience requirement match
+   */
   async calculateMatch(
     resumeId: string,
     jdId: string,
     weights: { semantic: number; keyword: number; years: number } = {
-      semantic: 0.6,
-      keyword: 0.95,
+      semantic: 0.4,
+      keyword: 0.55,
       years: 0.05
     }
   ): Promise<MatchResult> {
+    console.log(`[MatchingService] Starting match calculation - Resume: ${resumeId}, JD: ${jdId}`);
+
     // Verify documents exist and are indexed
     const resumeDoc = await db.getDocument(resumeId);
     const jdDoc = await db.getDocument(jdId);
-    
+
     if (!resumeDoc) {
+      console.error(`[MatchingService] ERROR: Resume document ${resumeId} not found in database`);
       throw new Error(`Resume document ${resumeId} not found in database`);
     }
     if (!jdDoc) {
+      console.error(`[MatchingService] ERROR: JD document ${jdId} not found in database`);
       throw new Error(`JD document ${jdId} not found in database`);
     }
-    
+
     if (resumeDoc.status !== 'indexed') {
+      console.error(`[MatchingService] ERROR: Resume ${resumeId} is not indexed yet. Status: ${resumeDoc.status}`);
       throw new Error(`Resume ${resumeId} is not indexed yet. Status: ${resumeDoc.status}`);
     }
     if (jdDoc.status !== 'indexed') {
+      console.error(`[MatchingService] ERROR: JD ${jdId} is not indexed yet. Status: ${jdDoc.status}`);
       throw new Error(`JD ${jdId} is not indexed yet. Status: ${jdDoc.status}`);
     }
-    
-    if (this.indexMetric === 'cosine') {
-      try {
-        const detectedMetric = await this.pineconeService.getIndexMetric();
-        this.indexMetric = detectedMetric;
-      } catch (error) {
-        this.indexMetric = 'cosine';
-      }
+
+    // Get cached index metric (initialized once on construction)
+    const indexMetric = await this.getIndexMetric();
+
+    const jdVector = await this.getJDVector(jdId, jdDoc);
+
+    // Verify embedding dimension matches expected
+    const expectedDimension = this.embeddingService.getDimension();
+    if (jdVector.length !== expectedDimension) {
+      console.error(`[MatchingService] ERROR: JD vector dimension mismatch: expected ${expectedDimension}, got ${jdVector.length}`);
+      throw new Error(`JD vector dimension mismatch: expected ${expectedDimension}, got ${jdVector.length}. Possible embedding model mismatch.`);
     }
 
-    const jdVector = await this.getJDVector(jdId);
-    const jdVector = await this.getJDVector(jdId);
-
-    let allMatches: Array<{ id: string; score: number; metadata: any }> = [];
-    
-    const largeTopK = 2000;
-    const queryFilter1 = {
-      doc_id: { $eq: resumeId },
-      doc_type: { $eq: 'resume' },
-      chunk_index: { $gte: 0 }
-    };
-    
-    try {
-      allMatches = await this.pineconeService.query(jdVector, largeTopK, queryFilter1);
-    } catch (error) {
-      // If filter format 1 fails, try simpler format
-      const queryFilter2 = {
+    /**
+     * Step 3: Compare embeddings using similarity search
+     * 
+     * Process:
+     * - Provide JD vector (doc-level embedding representing entire job description)
+     * - Pinecone finds closest resume chunks (chunk-level embeddings)
+     * - If closest chunks are about required skills/responsibilities → Strong semantic match
+     * 
+     * Similarity metric (cosine):
+     * - Same meaning → score ≈ 1.0
+     * - Different meaning → score ≈ 0.0
+     * - Opposite → negative scores (normalized to [0,1])
+     * 
+     * Query top ~20 chunks for semantic matching (we'll use more for keyword matching)
+     */
+    const chunkTopK = 20; // Top ~20 relevant chunks for semantic score aggregation
+    const queryFilter = {
         doc_id: resumeId,
         doc_type: 'resume',
         chunk_index: { $gte: 0 }
       };
-      try {
-        allMatches = await this.pineconeService.query(jdVector, largeTopK, queryFilter2);
-      } catch (err) {
-      }
-    }
-    
-    if (allMatches.length === 0) {
-      try {
-        const resumeDoc = await db.getDocument(resumeId);
-        const expectedChunkCount = (resumeDoc?.vectorCount || 200) - 1; // Subtract 1 for docvec
-        const maxChunksToFetch = Math.min(expectedChunkCount, 200);
-        const chunkIds = Array.from({ length: maxChunksToFetch }, (_, i) => `${resumeId}:chunk:${i}`);
-        
-        const fetchedChunks = await this.pineconeService.fetchByIds(chunkIds);
-        
-        // Compute similarity scores for fetched chunks
-        allMatches = fetchedChunks.map(chunk => {
-          const cosineSimilarity = this.computeCosineSimilarity(jdVector, chunk.values);
-          const normalizedScore = (cosineSimilarity + 1) / 2;
-          return {
-            id: chunk.id,
-            score: normalizedScore,
-            metadata: chunk.metadata
-          };
-        }).sort((a, b) => b.score - a.score);
-      } catch (error) {
-        const unfilteredMatches = await this.pineconeService.query(jdVector, 5000);
-        allMatches = unfilteredMatches.filter(m => 
-          m.metadata?.doc_id === resumeId && 
-          m.metadata?.doc_type === 'resume' &&
-          (m.metadata?.chunk_index ?? -1) >= 0
-        );
-      }
-    }
-    
-    const normalizedMatches = allMatches.map(match => ({
-      ...match,
-      score: this.normalizeScore(match.score, this.indexMetric)
-    }));
 
-    const semanticScore = this.computeSemanticScore(normalizedMatches);
-    
+    let allMatches: Array<{ id: string; score: number; metadata: any }> = [];
+
+      try {
+        allMatches = await this.pineconeService.query(jdVector, chunkTopK, queryFilter, false, true);
+      } catch (error) {
+        console.warn(`[MatchingService] Query failed, trying fallback method:`, error);
+        try {
+          const resumeDoc = await db.getDocument(resumeId);
+          if (!resumeDoc) {
+            throw new Error(`Resume document ${resumeId} not found for fallback fetch`);
+          }
+          const expectedChunkCount = (resumeDoc.vectorCount || 200) - 1; // Subtract 1 for docvec
+          const maxChunksToFetch = Math.min(expectedChunkCount, 200);
+          // Use canonical docId from DB record (_id or docId field)
+          const canonicalDocId = (resumeDoc as any)._id || resumeDoc.docId || resumeId;
+          const chunkIds = Array.from({ length: maxChunksToFetch }, (_, i) => `${canonicalDocId}::chunk::${i}`);
+
+          const fetchedChunks = await this.pineconeService.fetchByIds(chunkIds);
+
+          // Validate vector dims on fallback cosine computation
+          const expectedDimension = this.embeddingService.getDimension();
+          allMatches = fetchedChunks
+            .filter(chunk => {
+              if (jdVector.length !== chunk.values.length) {
+                console.warn(`[MatchingService] Dim mismatch jdVec vs chunkVec: ${jdVector.length} vs ${chunk.values.length}, jdId: ${jdId}, chunkId: ${chunk.id}`);
+                return false; // Skip this chunk
+              }
+              if (chunk.values.length !== expectedDimension) {
+                console.warn(`[MatchingService] Skipping chunk ${chunk.id}: dimension mismatch (expected ${expectedDimension}, got ${chunk.values.length})`);
+                return false;
+              }
+              return true;
+            })
+            .map(chunk => {
+              const cosineSimilarity = this.computeCosineSimilarity(jdVector, chunk.values);
+              // Use same normalization as normalizeScoreUtil for cosine
+              const normalizedScore = normalizeScoreUtil(cosineSimilarity, 'cosine');
+              return {
+                id: chunk.id,
+                score: normalizedScore,
+                metadata: chunk.metadata
+              };
+            })
+            .sort((a, b) => b.score - a.score);
+        } catch (err) {
+          console.error(`[MatchingService] Fallback method also failed:`, err);
+          throw err;
+      }
+    }
+
+    /**
+     * Step 4: Aggregation of top semantic matches
+     * 
+     * Process:
+     * 1. Take top ~20 relevant resume chunks
+     * 2. Normalize scores to [0-1]
+     * 3. Weighted average + quality/coverage boost
+     * 
+     * Semantic Matching Process:
+     * 1. Resume is split into chunks (40-150 vectors) - each work section, skill block, project, etc.
+     * 2. JD is stored as 1 doc-level embedding (summarized meaning representation)
+     * 3. We query Pinecone with JD vector to find closest resume chunks
+     * 4. Similarity scores indicate conceptual match:
+     *    - Score ≈ 1.0: Same meaning (very strong match)
+     *    - Score ≈ 0.6-0.85: Good but not complete match
+     *    - Score ≈ 0.4-0.6: Weak/partial relevance
+     *    - Score < 0.4: Conceptually unrelated
+     * 
+     * Why semantic matching is needed:
+     * - Resumes rarely copy JD keywords exactly
+     * - Example: JD says "AWS experience" but resume says "EC2 via Kubernetes"
+     * - Vector embedding similarity captures the conceptual match even without exact keywords
+     */
+    const normalizedMatches = allMatches.map(match => {
+      const normalized = normalizeScoreUtil(match.score, indexMetric);
+      return {
+        ...match,
+        score: normalized
+      };
+    });
+
+    // Take top ~20 relevant resume chunks for aggregation
+    const topChunksForSemantic = 20;
+    const semanticScore = this.computeSemanticScoreWithBoosts(normalizedMatches.slice(0, topChunksForSemantic));
+
     const topMatches = normalizedMatches.slice(0, 20);
     const { keywordScore, matchedSkills, missingSkills } = await this.computeKeywordScore(
       jdId,
@@ -145,10 +254,12 @@ export class MatchingService {
     const yearsResult = await this.computeYearsScore(jdId, resumeId);
     const yearsScore = yearsResult.score;
     const resumeYears = yearsResult.resumeYears ?? null;
+
     const finalScore = Math.max(
       0,
       Math.min(
         1,
+        weights.semantic * semanticScore +
           weights.keyword * keywordScore +
           weights.years * yearsScore
       )
@@ -164,7 +275,7 @@ export class MatchingService {
       topMatches
     );
 
-    return {
+    const result = {
       resumeId,
       jdId,
       finalPercent,
@@ -182,41 +293,62 @@ export class MatchingService {
       })),
       explain
     };
+
+    console.log(`[MatchingService] Match calculation completed: ${finalPercent}% match (semantic: ${semanticScore.toFixed(4)}, keyword: ${keywordScore.toFixed(4)}, years: ${yearsScore.toFixed(4)})`);
+
+    return result;
   }
 
-  private async getJDVector(jdId: string): Promise<number[]> {
-    const docvecId = `${jdId}:docvec`;
-    
+  /**
+   * Step 2: Convert text → embeddings
+   * 
+   * Uses a language model (Gemini) to convert JD text into a vector of numbers.
+   * Example: [0.12, -0.33, 0.88, ...] with ~768 or 1024 dimensions
+   * 
+   * Vectors with similar meanings lie closer together in space.
+   * This allows us to find conceptually similar content even without exact keyword matches.
+   * 
+   * JD is stored as 1 doc-level embedding (summarized into a single meaning representation)
+   */
+  private async getJDVector(jdId: string, jdDoc: any): Promise<number[]> {
+    // Use canonical docId from DB record (_id or docId field)
+    const canonicalDocId = (jdDoc as any)._id || jdDoc.docId || jdId;
+    const docvecId = `${canonicalDocId}::docvec`;
+
     try {
       const fetched = await this.pineconeService.fetchById(docvecId);
       if (fetched && fetched.values && Array.isArray(fetched.values) && fetched.values.length > 0) {
         return fetched.values;
       }
     } catch (error) {
+      console.warn(`[MatchingService] Failed to fetch JD vector from Pinecone:`, error);
     }
-
-    const jdDoc = await db.getDocument(jdId);
-    const jdDoc = await db.getDocument(jdId);
     if (jdDoc && jdDoc.rawText) {
       const vec = await this.embeddingService.embedText(jdDoc.rawText);
-      
+
       try {
+        const uploadedAt = new Date().toISOString();
+        const canonicalDocId = (jdDoc as any)._id || jdDoc.docId || jdId;
         await this.pineconeService.upsertChunks([{
           id: docvecId,
           vector: vec,
           metadata: {
-            doc_id: jdId,
+            doc_id: canonicalDocId, // Use canonical docId
             doc_type: 'job_description',
             chunk_index: -1,
+            version: 'v1',
+            uploaded_at: uploadedAt,
             full_text_length: jdDoc.rawText.length
           }
         }]);
       } catch (error) {
+        console.warn(`[MatchingService] Failed to store JD vector in Pinecone:`, error);
       }
-      
+
       return vec;
     }
 
+    console.error(`[MatchingService] ERROR: Cannot get JD vector - no docvec and no raw text available for JD: ${jdId}`);
     throw new Error(`Cannot get JD vector: no docvec and no raw text available for JD: ${jdId}`);
   }
 
@@ -224,89 +356,30 @@ export class MatchingService {
     if (vec1.length !== vec2.length) {
       throw new Error(`Vector dimension mismatch: ${vec1.length} vs ${vec2.length}`);
     }
-    
+
     let dotProduct = 0;
     let norm1 = 0;
     let norm2 = 0;
-    
-    for (let i = 0; i < vec1.length; i++) {
+
+    for (let i = 0;i < vec1.length;i++) {
       dotProduct += vec1[i] * vec2[i];
       norm1 += vec1[i] * vec1[i];
       norm2 += vec2[i] * vec2[i];
     }
-    
+
     const denominator = Math.sqrt(norm1) * Math.sqrt(norm2);
     if (denominator === 0) return 0;
-    
+
     return dotProduct / denominator;
   }
 
-  private normalizeScore(rawScore: number, metric: 'cosine' | 'euclidean' | 'dotproduct' = 'cosine'): number {
-    if (!Number.isFinite(rawScore)) {
-      return 0;
-    }
 
-    if (metric === 'cosine') {
-      if (rawScore >= 0 && rawScore <= 1) {
-        return rawScore;
-      }
-      return Math.max(0, Math.min(1, (rawScore + 1) / 2));
-    } else if (metric === 'dotproduct') {
-      return Math.max(0, Math.min(1, rawScore));
-    } else {
-      return Math.max(0, Math.min(1, 1 - rawScore));
-    }
-  }
 
-  private computeSemanticScore(matches: Array<{ score: number }>): number {
-    if (matches.length === 0) return 0;
-
-    const relevanceThreshold = 0.2;
-    const relevantMatches = matches
-      .map(m => Math.max(0, Math.min(1, m.score)))
-      .filter(score => score >= relevanceThreshold);
-
-    if (relevantMatches.length === 0) {
-      const topScore = Math.max(0, Math.min(1, matches[0]?.score || 0));
-      return topScore * 0.5;
-    }
-
-    const maxChunksToConsider = Math.min(20, relevantMatches.length);
-    const chunksToUse = relevantMatches.slice(0, maxChunksToConsider);
-    
-    const weights = [0.4, 0.25, 0.15, 0.1, 0.05, 0.025, 0.015, 0.01, 0.005, 0.003];
-    let weightedSum = 0;
-    let totalWeight = 0;
-
-    for (let i = 0; i < chunksToUse.length; i++) {
-      const score = chunksToUse[i];
-      const weight = i < weights.length ? weights[i] : Math.exp(-(i - weights.length) * 0.2) * weights[weights.length - 1];
-      
-      weightedSum += score * weight;
-      totalWeight += weight;
-    }
-
-    const mean = totalWeight > 0 ? weightedSum / totalWeight : 0;
-
-    const highQualityMatches = chunksToUse.filter(s => s >= 0.7).length;
-    const veryHighQualityMatches = chunksToUse.filter(s => s >= 0.85).length;
-    const excellentMatches = chunksToUse.filter(s => s >= 0.9).length;
-    
-    const qualityBoost = Math.min(0.2, 
-      highQualityMatches * 0.015 + 
-      veryHighQualityMatches * 0.025 + 
-      excellentMatches * 0.03
-    );
-    
-    const coverageBoost = Math.min(0.15, Math.min(chunksToUse.length, 15) / 15 * 0.15);
-
-    return Math.max(0, Math.min(1, mean + qualityBoost + coverageBoost));
-  }
 
   private async computeKeywordScore(
     jdId: string,
     resumeId: string,
-    topMatches: Array<{ metadata: any }>
+    _topMatches: Array<{ metadata: any }>
   ): Promise<{ keywordScore: number; matchedSkills: string[]; missingSkills: string[] }> {
     const jdRecord = await db.getJD(jdId);
     if (!jdRecord || (jdRecord.topSkills.length === 0 && jdRecord.generalSkills.length === 0)) {
@@ -319,70 +392,44 @@ export class MatchingService {
     const skillSynonyms = jdRecord.skillSynonyms || {};
 
     const skillEmbeddings = await this.getOrCreateSkillEmbeddings(jdId, allSkills);
-
     const semanticMatches = await this.matchSkillsSemantically(resumeId, allSkills, skillEmbeddings);
-    const resumeDoc = await db.getDocument(resumeId);
-    let resumeText = '';
-    
-    if (resumeDoc && resumeDoc.rawText) {
-      resumeText = resumeDoc.rawText.toLowerCase();
-    } else {
-      resumeText = topMatches
-        .map(m => m.metadata.text_snippet || '')
-        .join(' ')
-        .toLowerCase();
-    }
-
-    const normalizedText = resumeText
-      .replace(/[^\w\s]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
 
     const matchedSkills: string[] = [];
     const missingSkills: string[] = [];
-    const semanticThreshold = 0.65;
-    const evidenceThreshold = 0.75;
-    const evidenceThresholdWithTextMatch = 0.60;
-    const useAgg = 'max';
+    // Tuning defaults: start conservative and tune with data
+    const semanticThreshold = 0.6; // Start 0.6
+    const evidenceThreshold = 0.6; // Start 0.6
 
     for (const skill of allSkills) {
-      const isTop = isTopSkill.has(skill);
-      
       const semanticMatch = semanticMatches[skill];
-      const keywordMatch = this.matchSkill(skill, normalizedText);
-      
       const synonyms = skillSynonyms[skill] || [skill];
-      
-      let semanticMatchWithEvidence = false;
+
+      let isMatched = false;
+
       if (semanticMatch && semanticMatch.evidenceChunks.length > 0) {
         const scores = semanticMatch.evidenceChunks.map(chunk => chunk.score);
-        const aggScore = useAgg === 'max' ? Math.max(...scores) : this.meanTopN(scores, 3);
-        
-        let bestMatchingChunk: { chunk: typeof semanticMatch.evidenceChunks[0]; hasTextMatch: boolean } | null = null;
-        let hasTextMatchInAnyChunk = false;
-        
-        for (const chunk of semanticMatch.evidenceChunks) {
-          const hasTextMatch = this.evidenceContainsSkillOrSynonym(chunk.snippet, skill, synonyms);
-          
-          if (hasTextMatch) {
-            hasTextMatchInAnyChunk = true;
-            if (!bestMatchingChunk || chunk.score > bestMatchingChunk.chunk.score) {
-              bestMatchingChunk = { chunk, hasTextMatch: true };
-            }
+        const aggScore = this.meanTopN(scores, 3); // meanTopN use N = 3
+        const topScore = semanticMatch.evidenceChunks[0].score;
+
+        // Check all evidence chunks for keyword matches (OR condition - additional validation)
+        let keywordMatch = false;
+        for (const chunk of semanticMatch.evidenceChunks.slice(0, 5)) {
+          if (this.evidenceContainsSkillOrSynonym(chunk.snippet, skill, synonyms)) {
+            keywordMatch = true;
+            break;
           }
         }
-        
-        const effectiveThreshold = hasTextMatchInAnyChunk ? evidenceThresholdWithTextMatch : evidenceThreshold;
-        
-        const topChunk = semanticMatch.evidenceChunks[0];
-        const chunkToCheck = bestMatchingChunk ? bestMatchingChunk.chunk : topChunk;
-        const evidenceOk = hasTextMatchInAnyChunk && chunkToCheck.score >= effectiveThreshold;
-        
-        semanticMatchWithEvidence = aggScore >= semanticThreshold && evidenceOk;
+
+        // Match if: (1) Strong semantic match OR (2) Keyword match found
+        if (aggScore >= semanticThreshold && topScore >= evidenceThreshold) {
+          // Strong semantic match - add to matched skills
+          isMatched = true;
+        } else if (keywordMatch) {
+          // Keyword match found (additional validation) - add to matched skills
+          isMatched = true;
+        }
       }
 
-      const isMatched = semanticMatchWithEvidence;
-      
       if (isMatched) {
         matchedSkills.push(skill);
       } else {
@@ -392,10 +439,10 @@ export class MatchingService {
 
     const topSkillsMatched = matchedSkills.filter(skill => isTopSkill.has(skill)).length;
     const generalSkillsMatched = matchedSkills.filter(skill => !isTopSkill.has(skill)).length;
-    
+
     const totalWeightedMatches = (topSkillsMatched * 2) + generalSkillsMatched;
     const totalWeightedSkills = (jdRecord.topSkills.length * 2) + jdRecord.generalSkills.length;
-    
+
     const keywordScore = totalWeightedSkills > 0
       ? totalWeightedMatches / totalWeightedSkills
       : 0;
@@ -408,17 +455,20 @@ export class MatchingService {
     skills: string[]
   ): Promise<{ [skill: string]: number[] }> {
     const jdRecord = await db.getJD(jdId);
-    
+
     if (jdRecord?.skillEmbeddings) {
       return jdRecord.skillEmbeddings;
     }
 
     const embeddings: { [skill: string]: number[] } = {};
-    
-    for (const skill of skills) {
-      const contextualizedSkill = `Skill: ${skill} - technical expertise and experience`;
-      const embedding = await this.embeddingService.embedText(contextualizedSkill);
-      embeddings[skill] = embedding;
+
+    // Generate embeddings in parallel for faster processing
+    const skillTexts = skills.map(skill => `Skill: ${skill} - technical expertise and experience`);
+    const skillEmbeddingsArray = await this.embeddingService.embedTexts(skillTexts, skills.length);
+
+    // Map embeddings back to skills
+    for (let i = 0;i < skills.length;i++) {
+      embeddings[skills[i]] = skillEmbeddingsArray[i];
     }
     if (jdRecord) {
       await db.updateJD(jdId, { skillEmbeddings: embeddings });
@@ -433,11 +483,16 @@ export class MatchingService {
     skillEmbeddings: { [skill: string]: number[] }
   ): Promise<{ [skill: string]: { similarity: number; evidenceChunks: Array<{ chunkId: string; snippet: string; score: number }> } }> {
     const results: { [skill: string]: { similarity: number; evidenceChunks: Array<{ chunkId: string; snippet: string; score: number }> } } = {};
-    const topK = 10; // Query top 10 chunks per skill
+    const targetTopK = 10; // Final chunks to use for evaluation
+    const retrieveTopK = targetTopK * 2; // Retrieve more for MMR/dedup (same as ChatService)
+    const dedupeThreshold = 0.95; // Same as ChatService
+    const mmrLambda = 0.6; // Same as ChatService
 
-    for (const skill of skills) {
+    for (let i = 0;i < skills.length;i++) {
+      const skill = skills[i];
       const skillEmbedding = skillEmbeddings[skill];
       if (!skillEmbedding) {
+        console.warn(`[MatchingService] No embedding found for skill: ${skill}`);
         continue;
       }
 
@@ -448,31 +503,40 @@ export class MatchingService {
           chunk_index: { $gte: 0 }
         };
 
-        let matches = await this.pineconeService.query(skillEmbedding, topK, queryFilter);
-        
+        // Retrieve more chunks initially for MMR/dedup
+        let matches = await this.pineconeService.query(skillEmbedding, retrieveTopK, queryFilter, false, true);
+
         if (matches.length === 0) {
           const allMatches = await this.pineconeService.query(skillEmbedding, 200);
-          matches = allMatches.filter(m => 
-            m.metadata?.doc_id === resumeId && 
+          matches = allMatches.filter(m =>
+            m.metadata?.doc_id === resumeId &&
             m.metadata?.doc_type === 'resume' &&
             (m.metadata?.chunk_index ?? -1) >= 0
-          ).slice(0, topK);
+          );
         }
 
         if (matches.length > 0) {
-          const normalizedScores = matches.map(m => 
-            this.normalizeScore(m.score, this.indexMetric)
-          );
+          const currentIndexMetric = await this.getIndexMetric();
 
-          const evidenceChunks = matches.slice(0, 10).map(match => ({
+          // Normalize scores
+          const normalizedChunks = matches.map(match => ({
             chunkId: match.id,
             snippet: match.metadata?.text_snippet || '',
-            score: this.normalizeScore(match.score, this.indexMetric)
+            score: normalizeScoreUtil(match.score, currentIndexMetric)
           }));
 
+          // Apply deduplication (same as ChatService)
+          const uniqueChunks = this.deduplicateChunks(normalizedChunks, dedupeThreshold);
+
+          // Apply MMR selection for diversity (same as ChatService)
+          const selectedChunks = this.mmrSelect(uniqueChunks, targetTopK, skillEmbedding, mmrLambda);
+
+          const normalizedScores = selectedChunks.map(chunk => chunk.score);
+          const maxSimilarity = Math.max(...normalizedScores);
+
           results[skill] = {
-            similarity: Math.max(...normalizedScores),
-            evidenceChunks
+            similarity: maxSimilarity,
+            evidenceChunks: selectedChunks
           };
         } else {
           results[skill] = {
@@ -481,6 +545,7 @@ export class MatchingService {
           };
         }
       } catch (error) {
+        console.error(`[MatchingService] Error matching skill "${skill}":`, error);
         results[skill] = {
           similarity: 0,
           evidenceChunks: []
@@ -491,72 +556,113 @@ export class MatchingService {
     return results;
   }
 
-  private matchSkill(skill: string, text: string): boolean {
-    const skillLower = skill.toLowerCase().trim();
-    
-    if (text.includes(skillLower)) {
-      return true;
-    }
+  /**
+   * Deduplicate chunks based on text similarity (same logic as ChatService)
+   */
+  private deduplicateChunks(
+    chunks: Array<{ chunkId: string; snippet: string; score: number }>,
+    _threshold: number = 0.95
+  ): Array<{ chunkId: string; snippet: string; score: number }> {
+    const seen = new Set<string>();
+    const unique: Array<{ chunkId: string; snippet: string; score: number }> = [];
 
-    const wordBoundaryPattern = new RegExp(`\\b${this.escapeRegex(skillLower)}\\b`, 'i');
-    if (wordBoundaryPattern.test(text)) {
-      return true;
-    }
+    for (const chunk of chunks) {
+      const normalized = chunk.snippet
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
 
-    const normalizedSkill = this.normalizeSkillName(skillLower);
-    const normalizedText = this.normalizeSkillName(text);
-    if (normalizedText.includes(normalizedSkill)) {
-      return true;
-    }
+      const hash = this.simpleHash(normalized);
 
-    const variations = this.getSkillVariations(skillLower);
-    for (const variation of variations) {
-      if (text.includes(variation)) {
-        return true;
-      }
-      const variationPattern = new RegExp(`\\b${this.escapeRegex(variation)}\\b`, 'i');
-      if (variationPattern.test(text)) {
-        return true;
-      }
-      const normalizedVariation = this.normalizeSkillName(variation);
-      if (normalizedText.includes(normalizedVariation)) {
-        return true;
+      if (!seen.has(hash)) {
+        seen.add(hash);
+        unique.push(chunk);
       }
     }
 
-    const words = skillLower.split(/[\s\-_]+/).filter(w => w.length > 2);
-    if (words.length > 1) {
-      const allWordsPresent = words.every(word => {
-        const wordPattern = new RegExp(`\\b${this.escapeRegex(word)}\\b`, 'i');
-        return wordPattern.test(text) || normalizedText.includes(this.normalizeSkillName(word));
-      });
-      if (allWordsPresent) {
-        return true;
-      }
-    }
-
-    if (this.fuzzyMatch(skillLower, text)) {
-      return true;
-    }
-
-    const acronyms = this.getAcronymExpansions(skillLower);
-    for (const expansion of acronyms) {
-      if (text.includes(expansion) || normalizedText.includes(this.normalizeSkillName(expansion))) {
-        return true;
-      }
-    }
-    const contextPatterns = [
-      new RegExp(`(?:experienced|proficient|skilled|expert|knowledge|familiar|worked|used|utilized|implemented|developed|built|created|designed|wrote|programmed|code|coding|programming|development|developing)\\s+(?:with|in|using|on|for|via|through|by)\\s+${this.escapeRegex(skillLower)}`, 'i'),
-      new RegExp(`${this.escapeRegex(skillLower)}\\s+(?:experience|expertise|knowledge|proficiency|skills|development|programming|coding)`, 'i'),
-    ];
-    for (const pattern of contextPatterns) {
-      if (pattern.test(text)) {
-        return true;
-      }
-    }
-
-    return false;
+    return unique;
   }
+
+  /**
+   * Simple hash function for deduplication (same as ChatService)
+   */
+  private simpleHash(str: string): string {
+    let hash = 0;
+    for (let i = 0;i < str.length;i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    return hash.toString();
+  }
+
+  /**
+   * MMR (Maximal Marginal Relevance) selection for diversity (same logic as ChatService)
+   */
+  private mmrSelect(
+    chunks: Array<{ chunkId: string; snippet: string; score: number }>,
+    topK: number,
+    _queryVector: number[],
+    lambda: number = 0.6
+  ): Array<{ chunkId: string; snippet: string; score: number }> {
+    if (chunks.length <= topK) {
+      return chunks;
+    }
+
+    // MMR: balance relevance and diversity
+    // Score = λ * relevance - (1-λ) * max_similarity_to_selected
+    const selected: Array<{ chunkId: string; snippet: string; score: number }> = [];
+    const remaining = [...chunks];
+
+    // Start with highest relevance chunk
+    remaining.sort((a, b) => b.score - a.score);
+    if (remaining.length > 0) {
+      selected.push(remaining.shift()!);
+    }
+
+    // Greedily select chunks that maximize MMR score
+    while (selected.length < topK && remaining.length > 0) {
+      let bestIdx = 0;
+      let bestScore = -Infinity;
+
+      for (let i = 0;i < remaining.length;i++) {
+        const chunk = remaining[i];
+
+        // Find max similarity to already selected chunks
+        let maxSimilarity = 0;
+        for (const selectedChunk of selected) {
+          const similarity = this.textSimilarity(chunk.snippet, selectedChunk.snippet);
+          maxSimilarity = Math.max(maxSimilarity, similarity);
+        }
+
+        // MMR score: λ * relevance - (1-λ) * max_similarity
+        const mmrScore = lambda * chunk.score - (1 - lambda) * maxSimilarity;
+
+        if (mmrScore > bestScore) {
+          bestScore = mmrScore;
+          bestIdx = i;
+        }
+      }
+
+      selected.push(remaining.splice(bestIdx, 1)[0]);
+    }
+
+    return selected;
+  }
+
+  /**
+   * Text similarity for MMR (Jaccard similarity on words, same as ChatService)
+   */
+  private textSimilarity(text1: string, text2: string): number {
+    const words1 = new Set(text1.toLowerCase().split(/\s+/));
+    const words2 = new Set(text2.toLowerCase().split(/\s+/));
+
+    const intersection = new Set([...words1].filter(x => words2.has(x)));
+    const union = new Set([...words1, ...words2]);
+
+    return union.size > 0 ? intersection.size / union.size : 0;
+  }
+
 
   private normalizeSkillName(skill: string): string {
     return skill
@@ -570,273 +676,110 @@ export class MatchingService {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
-  private fuzzyMatch(skill: string, text: string): boolean {
-    const words = text.toLowerCase().split(/\s+/);
-    const skillWords = skill.toLowerCase().split(/\s+/);
-    
-    if (skillWords.length === 1) {
-      const skillWord = skillWords[0];
-      for (const word of words) {
-        if (word.length < 3) continue;
-        
-        const distance = this.levenshteinDistance(skillWord, word);
-        const maxLength = Math.max(skillWord.length, word.length);
-        const similarity = 1 - (distance / maxLength);
-        
-        if (similarity > 0.85) {
-          return true;
-        }
-      }
-    }
-    
-    const normalizedSkill = this.normalizeSkillName(skill);
-    const normalizedText = this.normalizeSkillName(text);
-    
-    if (normalizedSkill.length > 0 && normalizedText.length > 0) {
-      const distance = this.levenshteinDistance(normalizedSkill, normalizedText.substring(0, normalizedSkill.length + 10));
-      const maxLength = Math.max(normalizedSkill.length, normalizedSkill.length + 10);
-      const similarity = 1 - (distance / maxLength);
-      
-      if (similarity > 0.85) {
-        return true;
-      }
-    }
-    
-    return false;
-  }
-
-  private levenshteinDistance(str1: string, str2: string): number {
-    const matrix: number[][] = [];
-    const len1 = str1.length;
-    const len2 = str2.length;
-
-    if (len1 === 0) return len2;
-    if (len2 === 0) return len1;
-
-    for (let i = 0; i <= len1; i++) {
-      matrix[i] = [i];
-    }
-    for (let j = 0; j <= len2; j++) {
-      matrix[0][j] = j;
-    }
-
-    for (let i = 1; i <= len1; i++) {
-      for (let j = 1; j <= len2; j++) {
-        if (str1[i - 1] === str2[j - 1]) {
-          matrix[i][j] = matrix[i - 1][j - 1];
-        } else {
-          matrix[i][j] = Math.min(
-            matrix[i - 1][j] + 1,
-            matrix[i][j - 1] + 1,
-            matrix[i - 1][j - 1] + 1
-          );
-        }
-      }
-    }
-
-    return matrix[len1][len2];
-  }
-
   private evidenceContainsSkillOrSynonym(snippet: string, skill: string, synonyms: string[]): boolean {
     const s = snippet.toLowerCase();
-    
+
     const allTerms = [skill, ...synonyms.filter(syn => syn !== skill)];
-    
+
     for (const term of allTerms) {
       const termLower = term.toLowerCase();
       const normalizedTerm = this.normalizeSkillName(termLower);
       const normalizedSnippet = this.normalizeSkillName(s);
-      
+
       if (s.includes(termLower)) {
         return true;
       }
-      
+
       if (normalizedSnippet.includes(normalizedTerm)) {
         return true;
       }
-      
+
       const wordBoundaryPattern = new RegExp(`\\b${this.escapeRegex(termLower)}\\b`, 'i');
       if (wordBoundaryPattern.test(s)) {
         return true;
       }
     }
-    
+
     return false;
   }
 
+  /**
+   * Calculate mean of top N scores
+   * Used for aggregating semantic match scores from top relevant chunks
+   */
   private meanTopN(scores: number[], n: number): number {
     if (scores.length === 0) return 0;
     const topN = scores.slice(0, n);
     return topN.reduce((sum, score) => sum + score, 0) / topN.length;
   }
 
-  private getAcronymExpansions(skill: string): string[] {
-    const expansions: string[] = [];
-    const skillLower = skill.toLowerCase();
-    
-    const acronymMap: { [key: string]: string[] } = {
-      'ml': ['machine learning', 'machinelearning'],
-      'ai': ['artificial intelligence', 'artificialintelligence'],
-      'nlp': ['natural language processing', 'naturallanguageprocessing'],
-      'cv': ['computer vision', 'computervision'],
-      'dl': ['deep learning', 'deeplearning'],
-      'ds': ['data science', 'datascience'],
-      'bi': ['business intelligence', 'businessintelligence'],
-      'etl': ['extract transform load', 'extracttransformload'],
-      'api': ['application programming interface', 'applicationprogramminginterface'],
-      'rest': ['representational state transfer', 'representationalstatetransfer'],
-      'graphql': ['graph query language', 'graphquerylanguage'],
-      'sql': ['structured query language', 'structuredquerylanguage'],
-      'nosql': ['not only sql', 'notonlysql'],
-      'ci/cd': ['continuous integration continuous deployment', 'continuousintegrationcontinuousdeployment'],
-      'devops': ['development operations', 'developmentoperations'],
-      'aws': ['amazon web services', 'amazonwebservices'],
-      'gcp': ['google cloud platform', 'googlecloudplatform'],
-      'azure': ['microsoft azure', 'microsoftazure'],
-      'ui': ['user interface', 'userinterface'],
-      'ux': ['user experience', 'userexperience'],
-      'sass': ['software as a service', 'softwareasaservice'],
-      'paas': ['platform as a service', 'platformasaservice'],
-      'iaas': ['infrastructure as a service', 'infrastructureasaservice'],
-    };
-    
-    if (acronymMap[skillLower]) {
-      expansions.push(...acronymMap[skillLower]);
-    }
-    
-    for (const [acronym, exp] of Object.entries(acronymMap)) {
-      if (skillLower.includes(acronym)) {
-        expansions.push(...exp);
-      }
-    }
-    
-    return expansions;
+  /**
+   * Compute semantic score with weighted average + quality/coverage boost
+   * 
+   * Takes top ~20 relevant resume chunks and:
+   * 1. Applies weighted average (higher weights for top matches)
+   * 2. Adds quality boost for high-scoring matches
+   * 3. Adds coverage boost for having multiple relevant chunks
+   */
+  private computeSemanticScoreWithBoosts(matches: Array<{ score: number }>): number {
+    if (matches.length === 0) return 0;
+
+    const relevanceThreshold = 0.2;
+    const relevantMatches = matches
+      .map(m => Math.max(0, Math.min(1, m.score)))
+      .filter(score => score >= relevanceThreshold);
+
+    if (relevantMatches.length === 0) {
+      const topScore = Math.max(0, Math.min(1, matches[0]?.score || 0));
+      return topScore * 0.5;
   }
 
-  private getSkillVariations(skill: string): string[] {
-    const variations: string[] = [];
-    const skillLower = skill.toLowerCase().trim();
-    
-    const techVariations: { [key: string]: string[] } = {
-      // JavaScript ecosystem
-      'node.js': ['nodejs', 'node', 'node js', 'nodejs', 'node.js'],
-      'react.js': ['reactjs', 'react', 'react js', 'reactjs', 'react.js', 'reactjs'],
-      'vue.js': ['vuejs', 'vue', 'vue js', 'vuejs', 'vue.js'],
-      'angular.js': ['angularjs', 'angular', 'angular js', 'angularjs', 'angular.js'],
-      'next.js': ['nextjs', 'next', 'next js', 'nextjs', 'next.js'],
-      'nuxt.js': ['nuxtjs', 'nuxt', 'nuxt js', 'nuxtjs', 'nuxt.js'],
-      'express.js': ['express', 'expressjs', 'express js', 'expressjs', 'express.js'],
-      'javascript': ['js', 'ecmascript', 'ecma script', 'javascript', 'js'],
-      'typescript': ['ts', 'typescript'],
-      
-      // Databases
-      'postgresql': ['postgres', 'postgresql', 'pg', 'postgres db', 'postgresql database'],
-      'mongodb': ['mongo', 'mongo db', 'mongodb', 'mongo database'],
-      'mysql': ['mysql', 'my sql', 'mysql database'],
-      'redis': ['redis', 'redis cache', 'redis database'],
-      'elasticsearch': ['elastic search', 'elasticsearch', 'es'],
-      'cassandra': ['cassandra', 'apache cassandra'],
-      'dynamodb': ['dynamo db', 'dynamodb', 'dynamo database'],
-      
-      // Programming languages
-      'c++': ['cpp', 'c plus plus', 'cplusplus', 'c++'],
-      'c#': ['csharp', 'c sharp', 'c#', 'csharp'],
-      'python': ['python', 'py', 'python3', 'python 3'],
-      'java': ['java', 'java programming', 'java language'],
-      'go': ['golang', 'go', 'go language', 'go programming'],
-      'rust': ['rust', 'rust language', 'rust programming'],
-      'php': ['php', 'php programming'],
-      'ruby': ['ruby', 'ruby on rails', 'ruby programming'],
-      'swift': ['swift', 'swift programming', 'swift language'],
-      'kotlin': ['kotlin', 'kotlin programming'],
-      'scala': ['scala', 'scala programming'],
-      
-      // Frameworks and libraries
-      '.net': ['dotnet', 'dot net', 'asp.net', 'asp net', '.net framework', 'dotnet framework'],
-      'django': ['django', 'django framework'],
-      'flask': ['flask', 'flask framework'],
-      'spring': ['spring', 'spring framework', 'spring boot', 'springboot'],
-      'laravel': ['laravel', 'laravel framework'],
-      'rails': ['ruby on rails', 'rails', 'ror'],
-      
-      // Cloud and DevOps
-      'aws': ['amazon web services', 'amazonwebservices', 'aws cloud'],
-      'azure': ['microsoft azure', 'microsoftazure', 'azure cloud'],
-      'gcp': ['google cloud platform', 'googlecloudplatform', 'gcp cloud', 'google cloud'],
-      'docker': ['docker', 'docker container', 'docker containers'],
-      'kubernetes': ['k8s', 'kubernetes', 'k8s orchestration'],
-      'terraform': ['terraform', 'terraform infrastructure'],
-      'ansible': ['ansible', 'ansible automation'],
-      
-      // AI/ML
-      'machine learning': ['ml', 'machinelearning', 'machine learning', 'ml algorithms'],
-      'artificial intelligence': ['ai', 'artificialintelligence', 'artificial intelligence'],
-      'deep learning': ['dl', 'deeplearning', 'deep learning', 'neural networks'],
-      'natural language processing': ['nlp', 'naturallanguageprocessing', 'natural language processing'],
-      'computer vision': ['cv', 'computervision', 'computer vision', 'image processing'],
-      'data science': ['ds', 'datascience', 'data science', 'data analytics'],
-      
-      // Tools and platforms
-      'git': ['git', 'git version control', 'git scm'],
-      'jenkins': ['jenkins', 'jenkins ci', 'jenkins cicd'],
-      'github': ['github', 'github actions', 'github ci'],
-      'gitlab': ['gitlab', 'gitlab ci', 'gitlab cicd'],
-      'jira': ['jira', 'atlassian jira'],
-      'confluence': ['confluence', 'atlassian confluence'],
-      
-      // Frontend
-      'html': ['html', 'html5', 'html 5'],
-      'css': ['css', 'css3', 'css 3'],
-      'sass': ['sass', 'scss', 'sass css'],
-      'less': ['less', 'less css'],
-      'webpack': ['webpack', 'webpack bundler'],
-      'babel': ['babel', 'babel js', 'babeljs'],
-      
-      // Testing
-      'jest': ['jest', 'jest testing'],
-      'mocha': ['mocha', 'mocha testing'],
-      'cypress': ['cypress', 'cypress testing'],
-      'selenium': ['selenium', 'selenium webdriver'],
-      
-      // Mobile
-      'react native': ['reactnative', 'react native', 'reactnative'],
-      'flutter': ['flutter', 'flutter development'],
-      'ios': ['ios', 'ios development', 'apple ios'],
-      'android': ['android', 'android development', 'google android'],
-    };
+    const maxChunksToConsider = Math.min(20, relevantMatches.length);
+    const chunksToUse = relevantMatches.slice(0, maxChunksToConsider);
 
-    for (const [key, vars] of Object.entries(techVariations)) {
-      const normalizedKey = this.normalizeSkillName(key);
-      const normalizedSkill = this.normalizeSkillName(skillLower);
-      
-      if (skillLower.includes(key) || key.includes(skillLower) || 
-          normalizedSkill.includes(normalizedKey) || normalizedKey.includes(normalizedSkill)) {
-        variations.push(...vars);
-      }
+    // Weighted average: higher weights for top matches
+    const weights = [0.4, 0.25, 0.15, 0.1, 0.05, 0.025, 0.015, 0.01, 0.005, 0.003];
+    let weightedSum = 0;
+    let totalWeight = 0;
+
+    for (let i = 0;i < chunksToUse.length;i++) {
+      const score = chunksToUse[i];
+      const weight = i < weights.length ? weights[i] : Math.exp(-(i - weights.length) * 0.2) * weights[weights.length - 1];
+
+      weightedSum += score * weight;
+      totalWeight += weight;
     }
 
-    const versionMatch = skillLower.match(/^(.+?)\s*(?:v|version)?\s*(\d+(?:\.\d+)?)$/);
-    if (versionMatch) {
-      const baseSkill = versionMatch[1].trim();
-      const version = versionMatch[2];
-      variations.push(baseSkill);
-      variations.push(baseSkill + version);
-      variations.push(baseSkill + ' ' + version);
-      variations.push(baseSkill + 'v' + version);
+    const mean = totalWeight > 0 ? weightedSum / totalWeight : 0;
+
+    // Quality boost: reward high-quality matches
+    // Fix #3: Require at least 3 chunks ≥ 0.70 to give quality boost
+    const highQualityMatches = chunksToUse.filter(s => s >= 0.7).length;
+    const veryHighQualityMatches = chunksToUse.filter(s => s >= 0.85).length;
+    const excellentMatches = chunksToUse.filter(s => s >= 0.9).length;
+
+    let qualityBoost = 0;
+    if (highQualityMatches >= 3) {
+      // Only give quality boost if we have at least 3 high-quality matches
+      qualityBoost = Math.min(0.2,
+        highQualityMatches * 0.015 +
+        veryHighQualityMatches * 0.025 +
+        excellentMatches * 0.03
+      );
     }
 
-    const commonSuffixes = ['framework', 'library', 'tool', 'technology', 'platform', 'service'];
-    for (const suffix of commonSuffixes) {
-      if (skillLower.endsWith(' ' + suffix)) {
-        variations.push(skillLower.replace(' ' + suffix, ''));
-      }
-      if (!skillLower.includes(suffix)) {
-        variations.push(skillLower + ' ' + suffix);
-      }
+    // Coverage boost: reward having multiple relevant chunks
+    // Fix #2: Reduced from 0.15 to 0.05
+    const coverageBoost = Math.min(0.05, (chunksToUse.length / 15) * 0.05);
+
+    // Fix #4: Cap final score BEFORE clamping to prevent false strong matches
+    let score = mean + qualityBoost + coverageBoost;
+    if (score > 0.9 && mean < 0.7) {
+      score = 0.85; // Prevent false strong matches
+    }
+    return Math.max(0, Math.min(1, score));
     }
 
-    return [...new Set(variations)];
-  }
 
   private async extractResumeYears(resumeId: string): Promise<number | undefined> {
     const resumeDoc = await db.getDocument(resumeId);
@@ -884,6 +827,7 @@ export class MatchingService {
 
     const resumeDoc = await db.getDocument(resumeId);
     if (!resumeDoc || !resumeDoc.rawText) {
+      console.warn(`[MatchingService] Resume document or raw text not found, returning zero score`);
       return { score: 0, resumeYears: undefined };
     }
 
@@ -916,7 +860,7 @@ export class MatchingService {
     }
 
     const ratio = maxYears / jdRecord.requiredYears;
-    
+
     let score: number;
     if (ratio >= 1.0) {
       score = 1.0;
@@ -934,13 +878,13 @@ export class MatchingService {
   private extractYearsFromDates(text: string): number {
     const dateRangePattern = /(\d{4}|\w+\s+\d{4})\s*[-–—]\s*(\d{4}|\w+\s+\d{4}|present|current)/gi;
     const rangeMatches = Array.from(text.matchAll(dateRangePattern));
-    
+
     if (rangeMatches.length > 0) {
       let totalMonths = 0;
       const currentYear = new Date().getFullYear();
       const currentMonth = new Date().getMonth();
 
-      for (let i = 0; i < rangeMatches.length; i++) {
+      for (let i = 0;i < rangeMatches.length;i++) {
         const match = rangeMatches[i];
         const startStr = match[1];
         const endStr = match[2].toLowerCase();
@@ -952,7 +896,7 @@ export class MatchingService {
 
         let endYear = currentYear;
         let endMonth = currentMonth;
-        
+
         if (endStr === 'present' || endStr === 'current') {
           endYear = currentYear;
           endMonth = currentMonth;
@@ -977,14 +921,14 @@ export class MatchingService {
       'july', 'august', 'september', 'october', 'november', 'december'
     ];
     const monthAbbr = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-    
+
     const monthYearPattern = new RegExp(
       `\\b(${monthNames.join('|')}|${monthAbbr.join('|')})\\.?\\s+(\\d{4})\\b`,
       'gi'
     );
-    
+
     const allMatches = Array.from(text.matchAll(monthYearPattern));
-    
+
     if (allMatches.length === 0) {
       return 0;
     }
@@ -996,15 +940,15 @@ export class MatchingService {
     for (const match of allMatches) {
       const monthStr = match[1].toLowerCase();
       const year = parseInt(match[2], 10);
-      
+
       let monthIndex = -1;
-      for (let i = 0; i < monthNames.length; i++) {
+      for (let i = 0;i < monthNames.length;i++) {
         if (monthStr.includes(monthNames[i]) || monthStr.includes(monthAbbr[i])) {
           monthIndex = i;
           break;
         }
       }
-      
+
       if (monthIndex >= 0 && year >= 1900 && year <= currentYear + 1) {
         dates.push({ year, month: monthIndex });
       }
@@ -1023,10 +967,10 @@ export class MatchingService {
 
     const endYear = currentYear;
     const endMonth = currentMonth;
-    
+
     const totalMonths = (endYear - earliest.year) * 12 + (endMonth - earliest.month);
     const years = Math.ceil(totalMonths / 12);
-    
+
     return years;
   }
 
@@ -1036,9 +980,9 @@ export class MatchingService {
       'july', 'august', 'september', 'october', 'november', 'december'
     ];
     const monthAbbr = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-    
+
     const lower = str.toLowerCase();
-    for (let i = 0; i < monthNames.length; i++) {
+    for (let i = 0;i < monthNames.length;i++) {
       if (lower.includes(monthNames[i]) || lower.includes(monthAbbr[i])) {
         return i;
       }
@@ -1100,4 +1044,3 @@ export class MatchingService {
     return parts.join('; ') + '.';
   }
 }
-

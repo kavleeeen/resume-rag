@@ -1,0 +1,49 @@
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/resume-rag-backend:latest', '.']
+  
+  # Push the container image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/resume-rag-backend:latest']
+  
+  # Deploy container image to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'resume-rag-backend'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/resume-rag-backend:latest'
+      - '--region'
+      - 'asia-south1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--port'
+      - '8080'
+      - '--memory'
+      - '4Gi'
+      - '--cpu'
+      - '4'
+      - '--timeout'
+      - '3600'
+      - '--max-instances'
+      - '10'
+      - '--min-instances'
+      - '1'
+      - '--set-env-vars'
+      - 'GOOGLE_CLOUD_PROJECT_ID=acquired-voice-474914-j2,EMBEDDING_DIMENSION=768,EMBEDDING_MODEL=text-embedding-004,PINECONE_INDEX_NAME=resume-rag-index,EMBEDDING_BATCH_SIZE=100,EMBEDDING_MAX_CONCURRENT=30,EMBEDDING_REQUEST_DELAY_MS=0'
+      - '--set-secrets'
+      - 'GEMINI_API_KEY=GEMINI_API_KEY:latest,PINECONE_API_KEY=PINECONE_API_KEY:latest,MONGODB_URI=MONGODB_URI:latest,GCS_BUCKET=GCS_BUCKET:latest'
+
+images:
+  - 'gcr.io/$PROJECT_ID/resume-rag-backend:latest'
+
+options:
+  machineType: 'E2_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: '1200s'
+

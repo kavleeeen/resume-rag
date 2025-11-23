@@ -12,8 +12,17 @@ export interface DocumentRecord {
   indexedAt?: Date;
   vectorCount?: number;
   extractedLength?: number;
+  fileHash?: string; // SHA-256 hash of the file content
   createdAt: Date;
   updatedAt: Date;
+}
+
+export interface FileHashRecord {
+  fileHash: string;
+  docId: string;
+  type: 'resume' | 'job_description';
+  createdAt: Date;
+  lastUsedAt: Date;
 }
 
 export interface JDRecord {
@@ -90,6 +99,7 @@ class DatabaseService {
   private filesCollection: Collection<FileRecord> | null = null;
   private comparisonsCollection: Collection<ComparisonRecord> | null = null;
   private chatSessionsCollection: Collection<ChatSession> | null = null;
+  private fileHashesCollection: Collection<FileHashRecord> | null = null;
   private isConnected = false;
 
   async connect(): Promise<void> {
@@ -103,7 +113,17 @@ class DatabaseService {
     }
 
     try {
-      this.client = new MongoClient(uri);
+      // Optimize MongoDB connection for cloud performance
+      this.client = new MongoClient(uri, {
+        maxPoolSize: 20, // Increased for high concurrency (30 concurrent embeddings)
+        minPoolSize: 5, // Keep more connections warm for faster response
+        serverSelectionTimeoutMS: 5000, // How long to try selecting a server
+        socketTimeoutMS: 45000, // How long a send or receive on a socket can take before timeout
+        connectTimeoutMS: 10000, // How long to wait for initial connection
+        maxIdleTimeMS: 30000, // Close connections after 30s of inactivity
+        heartbeatFrequencyMS: 10000, // Check server status every 10s
+      });
+      console.log(`[DatabaseService] Connecting to MongoDB...`);
       await this.client.connect();
       this.db = this.client.db('resume');
       this.documentsCollection = this.db.collection<DocumentRecord>('documents');
@@ -111,8 +131,16 @@ class DatabaseService {
       this.filesCollection = this.db.collection<FileRecord>('files');
       this.comparisonsCollection = this.db.collection<ComparisonRecord>('comparisons');
       this.chatSessionsCollection = this.db.collection<ChatSession>('chat_sessions');
+      this.fileHashesCollection = this.db.collection<FileHashRecord>('file_hashes');
       this.isConnected = true;
+
+      // Create index on fileHash for fast lookups
+      this.fileHashesCollection.createIndex({ fileHash: 1 }, { unique: true }).catch(() => {
+        // Index might already exist, ignore error
+      });
+      console.log(`[DatabaseService] MongoDB connected successfully`);
     } catch (error) {
+      console.error(`[DatabaseService] MongoDB connection failed:`, error);
       throw error;
     }
   }
@@ -127,6 +155,7 @@ class DatabaseService {
       this.filesCollection = null;
       this.comparisonsCollection = null;
       this.chatSessionsCollection = null;
+      this.fileHashesCollection = null;
     }
   }
 
@@ -136,7 +165,7 @@ class DatabaseService {
     }
   }
 
-  async createDocument(docId: string, type: 'resume' | 'job_description', filename: string): Promise<DocumentRecord> {
+  async createDocument(docId: string, type: 'resume' | 'job_description', filename: string, fileHash?: string): Promise<DocumentRecord> {
     await this.ensureConnected();
     if (!this.documentsCollection) throw new Error('Database not initialized');
 
@@ -149,8 +178,48 @@ class DatabaseService {
       createdAt: new Date(),
       updatedAt: new Date()
     };
+
+    if (fileHash) {
+      doc.fileHash = fileHash;
+    }
+
     await this.documentsCollection.insertOne(doc);
     return doc;
+  }
+
+  async createFileHashRecord(fileHash: string, docId: string, type: 'resume' | 'job_description'): Promise<void> {
+    await this.ensureConnected();
+    if (!this.fileHashesCollection) throw new Error('Database not initialized');
+
+    await this.fileHashesCollection.updateOne(
+      { fileHash },
+      {
+        $set: {
+          docId,
+          type,
+          lastUsedAt: new Date()
+        },
+        $setOnInsert: {
+          createdAt: new Date()
+        }
+      },
+      { upsert: true }
+    );
+  }
+
+  async getDocumentByHash(fileHash: string): Promise<FileHashRecord | null> {
+    await this.ensureConnected();
+    if (!this.fileHashesCollection) throw new Error('Database not initialized');
+
+    const record = await this.fileHashesCollection.findOne({ fileHash });
+    if (record) {
+      // Update lastUsedAt
+      await this.fileHashesCollection.updateOne(
+        { fileHash },
+        { $set: { lastUsedAt: new Date() } }
+      );
+    }
+    return record;
   }
 
   async getDocument(docId: string): Promise<DocumentRecord | null> {
@@ -263,12 +332,6 @@ class DatabaseService {
     return fileRecord;
   }
 
-  async getFileRecord(docId: string): Promise<FileRecord | null> {
-    await this.ensureConnected();
-    if (!this.filesCollection) throw new Error('Database not initialized');
-    return await this.filesCollection.findOne({ docId });
-  }
-
   async createComparison(
     comparisonId: string,
     resumeDocId: string,
@@ -300,6 +363,25 @@ class DatabaseService {
 
     await this.comparisonsCollection.insertOne(comparison);
     return comparison;
+  }
+
+  async updateComparison(
+    comparisonId: string,
+    updates: Partial<ComparisonRecord>
+  ): Promise<ComparisonRecord> {
+    await this.ensureConnected();
+    if (!this.comparisonsCollection) throw new Error('Database not initialized');
+
+    const result = await this.comparisonsCollection.findOneAndUpdate(
+      { comparisonId },
+      { $set: { ...updates, updatedAt: new Date() } },
+      { returnDocument: 'after' }
+    );
+
+    if (!result) {
+      throw new Error(`Comparison ${comparisonId} not found`);
+    }
+    return result;
   }
 
   async updateComparisonWithMatch(
@@ -362,12 +444,6 @@ class DatabaseService {
     return await this.comparisonsCollection.findOne({ comparisonId });
   }
 
-  async getComparisonByDocIds(resumeDocId: string, jdDocId: string): Promise<ComparisonRecord | null> {
-    await this.ensureConnected();
-    if (!this.comparisonsCollection) throw new Error('Database not initialized');
-    return await this.comparisonsCollection.findOne({ resumeDocId, jdDocId });
-  }
-
   async getOrCreateChatSession(comparisonId: string): Promise<ChatSession> {
     await this.ensureConnected();
     if (!this.chatSessionsCollection) throw new Error('Database not initialized');
@@ -376,14 +452,19 @@ class DatabaseService {
 
     if (!session) {
       const sessionId = `chat:${comparisonId}`;
-      session = {
+      const newSession = {
         sessionId,
         comparisonId,
         messages: [],
         createdAt: new Date(),
         updatedAt: new Date()
       };
-      await this.chatSessionsCollection.insertOne(session);
+      await this.chatSessionsCollection.insertOne(newSession);
+      session = await this.chatSessionsCollection.findOne({ comparisonId });
+    }
+
+    if (!session) {
+      throw new Error(`Failed to create or retrieve chat session for comparison ${comparisonId}`);
     }
 
     return session;
@@ -415,11 +496,6 @@ class DatabaseService {
     return result;
   }
 
-  async getChatSession(comparisonId: string): Promise<ChatSession | null> {
-    await this.ensureConnected();
-    if (!this.chatSessionsCollection) throw new Error('Database not initialized');
-    return await this.chatSessionsCollection.findOne({ comparisonId });
-  }
 }
 
 export const db = new DatabaseService();

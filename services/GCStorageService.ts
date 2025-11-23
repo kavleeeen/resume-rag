@@ -59,7 +59,7 @@ export class GCStorageService {
         resumable: false
       });
 
-      stream.on('error', (err) => {
+      stream.on('error', (err: Error) => {
         reject(new Error(`GCS upload failed: ${err.message}`));
       });
 

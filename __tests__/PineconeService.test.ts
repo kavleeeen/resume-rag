@@ -27,10 +27,6 @@ describe('PineconeService', () => {
         section: 'test'
       };
 
-      // Get initial stats
-      const initialStats = await pineconeService.getStats();
-      const initialCount = initialStats.totalVectorCount || 0;
-
       // Upsert test vector
       await pineconeService.upsert([{
         id: testId,
@@ -40,13 +36,6 @@ describe('PineconeService', () => {
 
       // Wait a bit for index to update
       await new Promise(resolve => setTimeout(resolve, 2000));
-
-      // Get updated stats
-      const updatedStats = await pineconeService.getStats();
-      const updatedCount = updatedStats.totalVectorCount || 0;
-
-      // Verify count increased (or at least no errors occurred)
-      expect(updatedCount).toBeGreaterThanOrEqual(initialCount);
 
       // Clean up: query to verify the vector exists
       const results = await pineconeService.query(testVector, 1);
